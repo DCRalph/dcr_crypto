@@ -11,8 +11,8 @@
     "url": "https://github.com/DCRalph"
   },
   "dependencies": {
-    "dcr_logger": "https://github.com/dcralph/dcr_logger.git"
-    
+    "mbedtls": "2.16.15",
+    "dcr_logger": "https://github.com/DCRalph/dcr_logger.git"
   },
   "build": {
     "srcDir": ".",
