@@ -11,7 +11,7 @@
     "url": "https://github.com/DCRalph"
   },
   "dependencies": {
-    "mbedtls": "2.16.15",
+    "armmbed/mbedtls": "2.23.0",
     "dcr_logger": "https://github.com/DCRalph/dcr_logger.git"
   },
   "build": {
