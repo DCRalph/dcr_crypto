@@ -11,8 +11,6 @@
     "url": "https://github.com/DCRalph"
   },
   "dependencies": {
-    "armmbed/mbedtls": "2.23.0",
-    "dcr_logger": "https://github.com/DCRalph/dcr_logger.git"
   },
   "build": {
     "unflags": ["-std=gnu++11", "-std=gnu++14"],
