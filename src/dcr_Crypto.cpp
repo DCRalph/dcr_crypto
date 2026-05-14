@@ -1,5 +1,5 @@
-#include "Crypto.h"
-#include <Logger.h>
+#include "dcr_Crypto.h"
+#include <dcr_Logger.h>
 #include <cstring>
 
 #undef LOG_TAG
