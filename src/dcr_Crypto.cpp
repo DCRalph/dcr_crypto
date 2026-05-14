@@ -1,83 +1,278 @@
 #include "dcr_Crypto.h"
 #include <dcr_Logger.h>
 #include <cstring>
+#include <memory>
 
 #undef LOG_TAG
 #define LOG_TAG "CRYPTO"
 
 namespace Crypto
 {
-
   static bool initialized = false;
 
   static const char *g_publicKeyPem = nullptr;
   static const char *g_privateKeyPem = nullptr;
   static const char *g_personalization = nullptr;
 
-  // Global mbedTLS contexts (persistent for entropy and RNG)
   static mbedtls_entropy_context cryptoEntropy;
   static mbedtls_ctr_drbg_context cryptoCtrDrbg;
+  static mbedtls_pk_context cryptoPublicKey;
+  static mbedtls_pk_context cryptoPrivateKey;
+  static bool publicKeyLoaded = false;
+  static bool privateKeyLoaded = false;
 
-  // ----------------------
-  // init()
-  // ----------------------
-  bool init(const char *publicKeyPem, const char *privateKeyPem, const char *personalization)
+  static constexpr size_t SHA256_HASH_LEN = 32;
+  static bool hasText(const char *value)
   {
-    if (initialized)
-    {
-      debugW("Crypto already initialised.");
-      return true;
-    }
+    return value && value[0] != '\0';
+  }
 
-    if (!publicKeyPem || !personalization)
-    {
-      debugE("Crypto init: publicKeyPem and personalization are required.");
-      return false;
-    }
-#ifdef INCLUDE_PRIVATE_KEYS
-    if (!privateKeyPem)
-    {
-      debugE("Crypto init: privateKeyPem is required when INCLUDE_PRIVATE_KEYS is set.");
-      return false;
-    }
-#endif
+  static void clearOutputLength(size_t *value)
+  {
+    if (value)
+      *value = 0;
+  }
 
-    g_publicKeyPem = publicKeyPem;
-    g_privateKeyPem = privateKeyPem;
-    g_personalization = personalization;
+  static void logMbedtlsError(const char *action, int rc)
+  {
+    debugE("%s failed: %d (-0x%x): %s",
+           action, rc, -rc, mbedtls_high_level_strerr(rc));
+  }
 
-    // Initialize contexts (these don't return errors, they always succeed)
-    mbedtls_entropy_init(&cryptoEntropy);
-    mbedtls_ctr_drbg_init(&cryptoCtrDrbg);
-
-    // Seed the RNG (can fail, but contexts are still initialized and need cleanup)
-    int ret = mbedtls_ctr_drbg_seed(&cryptoCtrDrbg,
-                                    mbedtls_entropy_func,
-                                    &cryptoEntropy,
-                                    reinterpret_cast<const unsigned char *>(g_personalization),
-                                    strlen(g_personalization));
-    if (ret != 0)
+  static bool validateInputBuffer(const char *operation,
+                                  const unsigned char *data,
+                                  size_t dataLen)
+  {
+    if (!data)
     {
-      debugE("Failed to seed RNG: %d (-0x%x): %s",
-             ret, -ret, mbedtls_high_level_strerr(ret));
-      // Free the contexts since initialization failed
-      mbedtls_ctr_drbg_free(&cryptoCtrDrbg);
-      mbedtls_entropy_free(&cryptoEntropy);
-      g_publicKeyPem = nullptr;
-      g_privateKeyPem = nullptr;
-      g_personalization = nullptr;
-      debugE("Crypto initialization failed.");
+      debugE("%s: data buffer is required.", operation);
       return false;
     }
 
-    debugD("Crypto initialised.");
-    initialized = true;
+    if (dataLen == 0)
+    {
+      debugE("%s: data length must be greater than zero.", operation);
+      return false;
+    }
+
     return true;
   }
 
-  // ----------------------
-  // deinit()
-  // ----------------------
+  static bool validateOutputBuffer(const char *operation,
+                                   unsigned char *output,
+                                   size_t bufferSize,
+                                   size_t *outputLen)
+  {
+    clearOutputLength(outputLen);
+
+    if (!outputLen)
+    {
+      debugE("%s: output length pointer is required.", operation);
+      return false;
+    }
+
+    if (!output)
+    {
+      debugE("%s: output buffer is required.", operation);
+      return false;
+    }
+
+    if (bufferSize == 0)
+    {
+      debugE("%s: output buffer size must be greater than zero.", operation);
+      return false;
+    }
+
+    return true;
+  }
+
+  static void freePersistentState()
+  {
+    mbedtls_pk_free(&cryptoPublicKey);
+    mbedtls_pk_free(&cryptoPrivateKey);
+    publicKeyLoaded = false;
+    privateKeyLoaded = false;
+
+    mbedtls_ctr_drbg_free(&cryptoCtrDrbg);
+    mbedtls_entropy_free(&cryptoEntropy);
+  }
+
+  static bool ensureInitialized(const char *operation)
+  {
+    if (initialized)
+      return true;
+
+    if (!init())
+    {
+      debugE("%s: crypto subsystem is not ready.", operation);
+      return false;
+    }
+
+    return true;
+  }
+
+  static bool requirePrivateKey(const char *operation)
+  {
+    if (hasPrivateKey())
+      return true;
+
+    debugE("%s: private key not configured. Customer devices should use public-key operations only.",
+           operation);
+    return false;
+  }
+
+  static mbedtls_pk_context *getPublicKeyContext(const char *operation)
+  {
+    if (!publicKeyLoaded)
+    {
+      debugE("%s: public key not loaded. Check setKeys() and init().", operation);
+      return nullptr;
+    }
+
+    return &cryptoPublicKey;
+  }
+
+  static mbedtls_pk_context *getPrivateKeyContext(const char *operation)
+  {
+    if (!privateKeyLoaded)
+    {
+      debugE("%s: private key not loaded.", operation);
+      return nullptr;
+    }
+
+    return &cryptoPrivateKey;
+  }
+
+  static bool computeSha256(const char *operation,
+                            const unsigned char *data,
+                            size_t dataLen,
+                            unsigned char hash[SHA256_HASH_LEN])
+  {
+    const mbedtls_md_info_t *mdInfo = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!mdInfo)
+    {
+      debugE("%s: failed to get SHA-256 digest info.", operation);
+      return false;
+    }
+
+    const int rc = mbedtls_md(mdInfo, data, dataLen, hash);
+    if (rc != 0)
+    {
+      logMbedtlsError(operation, rc);
+      return false;
+    }
+
+    return true;
+  }
+
+  static bool encryptWithPublicKey(const char *operation,
+                                   const unsigned char *data,
+                                   size_t dataLen,
+                                   unsigned char *encryptedData,
+                                   size_t bufferSize,
+                                   size_t *encryptedDataLen)
+  {
+    if (!ensureInitialized(operation))
+      return false;
+
+    mbedtls_pk_context *pk = getPublicKeyContext(operation);
+    if (!pk)
+      return false;
+
+    const size_t requiredLen = mbedtls_pk_get_len(pk);
+    if (bufferSize < requiredLen)
+    {
+      *encryptedDataLen = requiredLen;
+      debugE("%s: output buffer too small. Need %lu bytes.",
+             operation,
+             static_cast<unsigned long>(requiredLen));
+      return false;
+    }
+
+    const int rc = mbedtls_pk_encrypt(pk,
+                                      data,
+                                      dataLen,
+                                      encryptedData,
+                                      encryptedDataLen,
+                                      bufferSize,
+                                      mbedtls_ctr_drbg_random,
+                                      &cryptoCtrDrbg);
+    if (rc != 0)
+    {
+      logMbedtlsError(operation, rc);
+      clearOutputLength(encryptedDataLen);
+      return false;
+    }
+
+    return true;
+  }
+
+  bool init()
+  {
+    if (initialized)
+      return true;
+
+    if (!hasText(g_publicKeyPem))
+    {
+      debugE("init: public key PEM is required.");
+      return false;
+    }
+
+    if (!hasText(g_personalization))
+    {
+      debugE("init: personalization string is required.");
+      return false;
+    }
+
+    mbedtls_entropy_init(&cryptoEntropy);
+    mbedtls_ctr_drbg_init(&cryptoCtrDrbg);
+    mbedtls_pk_init(&cryptoPublicKey);
+    mbedtls_pk_init(&cryptoPrivateKey);
+
+    int rc = mbedtls_ctr_drbg_seed(&cryptoCtrDrbg,
+                                   mbedtls_entropy_func,
+                                   &cryptoEntropy,
+                                   reinterpret_cast<const unsigned char *>(g_personalization),
+                                   strlen(g_personalization));
+    if (rc != 0)
+    {
+      logMbedtlsError("init", rc);
+      freePersistentState();
+      return false;
+    }
+
+    rc = mbedtls_pk_parse_public_key(&cryptoPublicKey,
+                                     reinterpret_cast<const unsigned char *>(g_publicKeyPem),
+                                     strlen(g_publicKeyPem) + 1);
+    if (rc != 0)
+    {
+      logMbedtlsError("init", rc);
+      freePersistentState();
+      return false;
+    }
+    publicKeyLoaded = true;
+
+    if (hasPrivateKey())
+    {
+      rc = mbedtls_pk_parse_key(&cryptoPrivateKey,
+                                reinterpret_cast<const unsigned char *>(g_privateKeyPem),
+                                strlen(g_privateKeyPem) + 1,
+                                nullptr,
+                                0);
+      if (rc != 0)
+      {
+        logMbedtlsError("init", rc);
+        freePersistentState();
+        return false;
+      }
+      privateKeyLoaded = true;
+    }
+
+    initialized = true;
+    debugD("Crypto initialised.");
+    return true;
+  }
+
   bool deinit()
   {
     if (!initialized)
@@ -86,398 +281,240 @@ namespace Crypto
       return false;
     }
 
-    mbedtls_ctr_drbg_free(&cryptoCtrDrbg);
-    mbedtls_entropy_free(&cryptoEntropy);
-    g_publicKeyPem = nullptr;
-    g_privateKeyPem = nullptr;
-    g_personalization = nullptr;
+    freePersistentState();
     initialized = false;
     debugD("Crypto deinitialised.");
     return true;
   }
 
-  // Internal helper functions to load/free keys
-  static bool loadPrivateKey(mbedtls_pk_context *pk)
+  bool setKeys(const char *publicKeyPem, const char *privateKeyPem)
   {
-#ifdef INCLUDE_PRIVATE_KEYS
-    if (!g_privateKeyPem)
+    if (initialized)
     {
-      debugE("Private key PEM not configured.");
+      debugE("setKeys: call deinit() before changing keys.");
       return false;
     }
 
-    mbedtls_pk_init(pk);
-
-    int rc = mbedtls_pk_parse_key(pk,
-                                  reinterpret_cast<const unsigned char *>(g_privateKeyPem),
-                                  strlen(g_privateKeyPem) + 1,
-                                  nullptr,
-                                  0);
-
-    if (rc != 0)
+    if (!hasText(publicKeyPem))
     {
-      debugE("Failed to parse RSA private key: %d (-0x%x): %s",
-             rc, -rc, mbedtls_high_level_strerr(rc));
-      mbedtls_pk_free(pk); // Free the initialized context on failure
+      debugE("setKeys: public key PEM is required.");
       return false;
     }
 
-    return true;
-#else
-    return false;
-#endif
-  }
-
-  static bool loadPublicKey(mbedtls_pk_context *pk)
-  {
-    if (!g_publicKeyPem)
-    {
-      debugE("Public key PEM not configured.");
-      return false;
-    }
-
-    mbedtls_pk_init(pk);
-
-    int rc = mbedtls_pk_parse_public_key(pk,
-                                         reinterpret_cast<const unsigned char *>(g_publicKeyPem),
-                                         strlen(g_publicKeyPem) + 1);
-
-    if (rc != 0)
-    {
-      debugE("Failed to parse RSA public key: %d (-0x%x): %s",
-             rc, -rc, mbedtls_high_level_strerr(rc));
-      mbedtls_pk_free(pk); // Free the initialized context on failure
-      return false;
-    }
-
+    g_publicKeyPem = publicKeyPem;
+    g_privateKeyPem = hasText(privateKeyPem) ? privateKeyPem : nullptr;
     return true;
   }
 
-  static void freeKey(mbedtls_pk_context *pk)
+  bool setPersonalization(const char *personalization)
   {
-    // Always free the key context, even if crypto system isn't initialized
-    // This ensures cleanup if pk was initialized but crypto init failed
-    mbedtls_pk_free(pk);
+    if (initialized)
+    {
+      debugE("setPersonalization: call deinit() before changing personalization.");
+      return false;
+    }
+
+    if (!hasText(personalization))
+    {
+      debugE("setPersonalization: personalization is required.");
+      return false;
+    }
+
+    g_personalization = personalization;
+    return true;
   }
 
-  // ----------------------
-  // encrypt() - Dynamically loads/frees private key
-  // ----------------------
-  void encrypt(unsigned char *data,
+  bool hasPrivateKey()
+  {
+    return hasText(g_privateKeyPem);
+  }
+
+  bool encrypt(const unsigned char *data,
                size_t dataLen,
                unsigned char *encryptedData,
                size_t bufferSize,
                size_t *encryptedDataLen)
   {
-#ifdef INCLUDE_PRIVATE_KEYS
-    if (!init())
+    if (!validateOutputBuffer("encrypt", encryptedData, bufferSize, encryptedDataLen) ||
+        !validateInputBuffer("encrypt", data, dataLen))
     {
-      debugE("Cannot encrypt: Failed to initialize crypto system.");
-      return;
+      return false;
     }
 
-    mbedtls_pk_context pk;
-    if (!loadPrivateKey(&pk))
-    {
-      debugE("Cannot encrypt: Failed to load private key.");
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return;
-    }
-
-    int rc = mbedtls_pk_encrypt(&pk,
-                                data, dataLen,
-                                encryptedData, encryptedDataLen,
+    return encryptWithPublicKey("encrypt",
+                                data,
+                                dataLen,
+                                encryptedData,
                                 bufferSize,
-                                mbedtls_ctr_drbg_random, &cryptoCtrDrbg);
-
-    freeKey(&pk);
-    if (!deinit())
-    {
-      debugW("Warning: Failed to deinitialize crypto system after encryption.");
-    }
-
-    if (rc != 0)
-    {
-      debugE("Failed to encrypt data.");
-      debugE("mbedtls_pk_encrypt returned %d (-0x%x): %s",
-             rc, -rc, mbedtls_high_level_strerr(rc));
-    }
-#else
-    debugW("Encryption not available in non-DEBUG builds.");
-#endif
+                                encryptedDataLen);
   }
 
-  // ----------------------
-  // encryptPublic() - Dynamically loads/frees public key
-  // ----------------------
-  void encryptPublic(unsigned char *data,
-                     size_t dataLen,
-                     unsigned char *encryptedData,
-                     size_t bufferSize,
-                     size_t *encryptedDataLen)
-  {
-    if (!init())
-    {
-      debugE("Cannot encrypt: Failed to initialize crypto system.");
-      return;
-    }
-
-    mbedtls_pk_context pk;
-    if (!loadPublicKey(&pk))
-    {
-      debugE("Cannot encrypt: Failed to load public key.");
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return;
-    }
-
-    int rc = mbedtls_pk_encrypt(&pk,
-                                data, dataLen,
-                                encryptedData, encryptedDataLen,
-                                bufferSize,
-                                mbedtls_ctr_drbg_random, &cryptoCtrDrbg);
-
-    freeKey(&pk);
-    if (!deinit())
-    {
-      debugW("Warning: Failed to deinitialize crypto system after encryption.");
-    }
-
-    if (rc != 0)
-    {
-      debugE("Failed to encrypt data.");
-      debugE("mbedtls_pk_encrypt returned %d (-0x%x): %s",
-             rc, -rc, mbedtls_high_level_strerr(rc));
-    }
-  }
-
-  // ----------------------
-  // decrypt() - Dynamically loads/frees private key
-  // ----------------------
-  void decrypt(unsigned char *encryptedData,
+  bool decrypt(const unsigned char *encryptedData,
                size_t encryptedDataLen,
                unsigned char *decryptedData,
                size_t bufferSize,
                size_t *decryptedDataLen)
   {
-#ifdef INCLUDE_PRIVATE_KEYS
-    if (!init())
+    if (!validateOutputBuffer("decrypt", decryptedData, bufferSize, decryptedDataLen) ||
+        !validateInputBuffer("decrypt", encryptedData, encryptedDataLen))
     {
-      debugE("Cannot decrypt: Failed to initialize crypto system.");
-      return;
+      return false;
     }
 
-    mbedtls_pk_context pk;
-    if (!loadPrivateKey(&pk))
+    if (!requirePrivateKey("decrypt"))
+      return false;
+    if (!ensureInitialized("decrypt"))
+      return false;
+
+    mbedtls_pk_context *pk = getPrivateKeyContext("decrypt");
+    if (!pk)
+      return false;
+
+    const size_t keyLen = mbedtls_pk_get_len(pk);
+    if (encryptedDataLen != keyLen)
     {
-      debugE("Cannot decrypt: Failed to load private key.");
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return;
+      debugE("decrypt: ciphertext length must match RSA key size (%lu bytes).",
+             static_cast<unsigned long>(keyLen));
+      return false;
     }
 
-    int rc = mbedtls_pk_decrypt(&pk,
-                                encryptedData, encryptedDataLen,
-                                decryptedData, decryptedDataLen,
-                                bufferSize,
-                                mbedtls_ctr_drbg_random, &cryptoCtrDrbg);
-
-    freeKey(&pk);
-    if (!deinit())
+    std::unique_ptr<unsigned char[]> plaintext(new (std::nothrow) unsigned char[keyLen]);
+    if (!plaintext)
     {
-      debugW("Warning: Failed to deinitialize crypto system after decryption.");
+      debugE("decrypt: failed to allocate plaintext buffer.");
+      return false;
     }
 
+    size_t plaintextLen = 0;
+    const int rc = mbedtls_pk_decrypt(pk,
+                                      encryptedData,
+                                      encryptedDataLen,
+                                      plaintext.get(),
+                                      &plaintextLen,
+                                      keyLen,
+                                      mbedtls_ctr_drbg_random,
+                                      &cryptoCtrDrbg);
     if (rc != 0)
     {
-      debugE("Failed to decrypt data.");
-      debugE("mbedtls_pk_decrypt returned %d (-0x%x): %s",
-             rc, -rc, mbedtls_high_level_strerr(rc));
+      logMbedtlsError("decrypt", rc);
+      clearOutputLength(decryptedDataLen);
+      return false;
     }
-#else
-    debugW("Decryption not available in non-DEBUG builds.");
-#endif
+
+    if (bufferSize < plaintextLen)
+    {
+      *decryptedDataLen = plaintextLen;
+      debugE("decrypt: output buffer too small. Need %lu bytes.",
+             static_cast<unsigned long>(plaintextLen));
+      return false;
+    }
+
+    memcpy(decryptedData, plaintext.get(), plaintextLen);
+    *decryptedDataLen = plaintextLen;
+    return true;
   }
 
-  // ----------------------
-  // sign() - Dynamically loads/frees private key
-  // ----------------------
-  void sign(const unsigned char *data,
+  bool sign(const unsigned char *data,
             size_t dataLen,
             unsigned char *signature,
             size_t *signatureLen)
   {
-#ifdef INCLUDE_PRIVATE_KEYS
-    if (!init())
+    if (!signatureLen)
     {
-      debugE("Cannot sign: Failed to initialize crypto system.");
-      return;
+      debugE("sign: signature length pointer is required.");
+      return false;
     }
 
-    mbedtls_pk_context pk;
-    if (!loadPrivateKey(&pk))
+    const size_t signatureCapacity = *signatureLen;
+    *signatureLen = 0;
+
+    if (!signature)
     {
-      debugE("Cannot sign: Failed to load private key.");
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return;
+      debugE("sign: signature buffer is required.");
+      return false;
     }
 
-    // Initialize a message digest context for SHA-256
-    mbedtls_md_context_t md_ctx;
-    mbedtls_md_init(&md_ctx);
-    const mbedtls_md_info_t *md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!md_info)
+    if (!validateInputBuffer("sign", data, dataLen))
     {
-      debugE("Failed to get md info.");
-      mbedtls_md_free(&md_ctx);
-      freeKey(&pk);
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return;
+      return false;
     }
 
-    if (mbedtls_md_setup(&md_ctx, md_info, 0) != 0)
+    if (!requirePrivateKey("sign"))
+      return false;
+    if (!ensureInitialized("sign"))
+      return false;
+
+    mbedtls_pk_context *pk = getPrivateKeyContext("sign");
+    if (!pk)
+      return false;
+
+    const size_t requiredLen = mbedtls_pk_get_len(pk);
+    if (signatureCapacity < requiredLen)
     {
-      debugE("Failed to setup md context.");
-      mbedtls_md_free(&md_ctx);
-      freeKey(&pk);
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return;
+      *signatureLen = requiredLen;
+      debugE("sign: signature buffer too small. Need %lu bytes.",
+             static_cast<unsigned long>(requiredLen));
+      return false;
     }
 
-    // Compute the hash of the data
-    unsigned char hash[32] = {0};
-    if (mbedtls_md(md_info, data, dataLen, hash) != 0)
+    unsigned char hash[SHA256_HASH_LEN] = {0};
+    if (!computeSha256("sign", data, dataLen, hash))
     {
-      debugE("Failed to compute hash.");
-      mbedtls_md_free(&md_ctx);
-      freeKey(&pk);
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return;
-    }
-    mbedtls_md_free(&md_ctx);
-
-    int ret = mbedtls_pk_sign(&pk,
-                              MBEDTLS_MD_SHA256,
-                              hash, 0,
-                              signature, signatureLen,
-                              mbedtls_ctr_drbg_random, &cryptoCtrDrbg);
-
-    freeKey(&pk);
-    if (!deinit())
-    {
-      debugW("Warning: Failed to deinitialize crypto system after signing.");
+      return false;
     }
 
-    if (ret != 0)
+    size_t actualLen = 0;
+    const int rc = mbedtls_pk_sign(pk,
+                                   MBEDTLS_MD_SHA256,
+                                   hash,
+                                   SHA256_HASH_LEN,
+                                   signature,
+                                   &actualLen,
+                                   mbedtls_ctr_drbg_random,
+                                   &cryptoCtrDrbg);
+    if (rc != 0)
     {
-      debugE("Failed to sign data: -0x%x", -ret);
+      logMbedtlsError("sign", rc);
+      return false;
     }
-#else
-    debugW("Signing not available in non-DEBUG builds.");
-#endif
+
+    *signatureLen = actualLen;
+    return true;
   }
 
-  // ----------------------
-  // verify() - Dynamically loads/frees public key
-  // ----------------------
   bool verify(const unsigned char *data,
               size_t dataLen,
               const unsigned char *signature,
               size_t signatureLen)
   {
-    if (!init())
+    if (!validateInputBuffer("verify", data, dataLen) ||
+        !validateInputBuffer("verify", signature, signatureLen))
     {
-      debugE("Cannot verify: Failed to initialize crypto system.");
       return false;
     }
 
-    mbedtls_pk_context pk;
-    if (!loadPublicKey(&pk))
+    if (!ensureInitialized("verify"))
+      return false;
+
+    mbedtls_pk_context *pk = getPublicKeyContext("verify");
+    if (!pk)
+      return false;
+
+    unsigned char hash[SHA256_HASH_LEN] = {0};
+    if (!computeSha256("verify", data, dataLen, hash))
     {
-      debugE("Cannot verify: Failed to load public key.");
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
       return false;
     }
 
-    // Initialize a message digest context for SHA-256
-    mbedtls_md_context_t md_ctx;
-    mbedtls_md_init(&md_ctx);
-    const mbedtls_md_info_t *md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!md_info)
+    const int rc = mbedtls_pk_verify(pk,
+                                     MBEDTLS_MD_SHA256,
+                                     hash,
+                                     SHA256_HASH_LEN,
+                                     signature,
+                                     signatureLen);
+    if (rc != 0)
     {
-      debugE("Failed to get md info.");
-      mbedtls_md_free(&md_ctx);
-      freeKey(&pk);
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return false;
-    }
-
-    if (mbedtls_md_setup(&md_ctx, md_info, 0) != 0)
-    {
-      debugE("Failed to setup md context.");
-      mbedtls_md_free(&md_ctx);
-      freeKey(&pk);
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return false;
-    }
-
-    // Compute the hash of the data
-    unsigned char hash[32] = {0};
-    if (mbedtls_md(md_info, data, dataLen, hash) != 0)
-    {
-      debugE("Failed to compute hash.");
-      mbedtls_md_free(&md_ctx);
-      freeKey(&pk);
-      if (!deinit())
-      {
-        debugW("Warning: Failed to deinitialize crypto system.");
-      }
-      return false;
-    }
-    mbedtls_md_free(&md_ctx);
-
-    int ret = mbedtls_pk_verify(&pk,
-                                MBEDTLS_MD_SHA256,
-                                hash, 0,
-                                signature, signatureLen);
-
-    freeKey(&pk);
-    if (!deinit())
-    {
-      debugW("Warning: Failed to deinitialize crypto system after verification.");
-    }
-
-    if (ret != 0)
-    {
-      debugE("Signature verification failed: -0x%x", ret);
+      logMbedtlsError("verify", rc);
       return false;
     }
 
