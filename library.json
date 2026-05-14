@@ -15,8 +15,6 @@
     "dcr_logger": "https://github.com/DCRalph/dcr_logger.git"
   },
   "build": {
-    "srcDir": ".",
-    "includeDir": ".",
     "unflags": ["-std=gnu++11", "-std=gnu++14"],
     "flags": ["-std=gnu++17"]
   }
