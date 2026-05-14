@@ -97,19 +97,24 @@ namespace Crypto
     mbedtls_entropy_free(&cryptoEntropy);
   }
 
-  static bool ensureInitialized(const char *operation)
+  // Tear down mbedtls contexts when present (no warning — used after each op).
+  static void releaseSession()
   {
-    if (initialized)
-      return true;
-
-    if (!init())
-    {
-      debugE("%s: crypto subsystem is not ready.", operation);
-      return false;
-    }
-
-    return true;
+    if (!initialized)
+      return;
+    freePersistentState();
+    initialized = false;
   }
+
+  // Loads keys/RNG for one operation; always releases RAM in the destructor.
+  struct SessionScope
+  {
+    const bool ok;
+    SessionScope() : ok(init()) {}
+    ~SessionScope() { releaseSession(); }
+    SessionScope(const SessionScope &) = delete;
+    SessionScope &operator=(const SessionScope &) = delete;
+  };
 
   static bool requirePrivateKey(const char *operation)
   {
@@ -172,9 +177,6 @@ namespace Crypto
                                    size_t bufferSize,
                                    size_t *encryptedDataLen)
   {
-    if (!ensureInitialized(operation))
-      return false;
-
     mbedtls_pk_context *pk = getPublicKeyContext(operation);
     if (!pk)
       return false;
@@ -281,8 +283,7 @@ namespace Crypto
       return false;
     }
 
-    freePersistentState();
-    initialized = false;
+    releaseSession();
     debugD("Crypto deinitialised.");
     return true;
   }
@@ -341,6 +342,13 @@ namespace Crypto
       return false;
     }
 
+    SessionScope session;
+    if (!session.ok)
+    {
+      debugE("encrypt: crypto subsystem is not ready.");
+      return false;
+    }
+
     return encryptWithPublicKey("encrypt",
                                 data,
                                 dataLen,
@@ -363,8 +371,13 @@ namespace Crypto
 
     if (!requirePrivateKey("decrypt"))
       return false;
-    if (!ensureInitialized("decrypt"))
+
+    SessionScope session;
+    if (!session.ok)
+    {
+      debugE("decrypt: crypto subsystem is not ready.");
       return false;
+    }
 
     mbedtls_pk_context *pk = getPrivateKeyContext("decrypt");
     if (!pk)
@@ -441,8 +454,13 @@ namespace Crypto
 
     if (!requirePrivateKey("sign"))
       return false;
-    if (!ensureInitialized("sign"))
+
+    SessionScope session;
+    if (!session.ok)
+    {
+      debugE("sign: crypto subsystem is not ready.");
       return false;
+    }
 
     mbedtls_pk_context *pk = getPrivateKeyContext("sign");
     if (!pk)
@@ -493,8 +511,12 @@ namespace Crypto
       return false;
     }
 
-    if (!ensureInitialized("verify"))
+    SessionScope session;
+    if (!session.ok)
+    {
+      debugE("verify: crypto subsystem is not ready.");
       return false;
+    }
 
     mbedtls_pk_context *pk = getPublicKeyContext("verify");
     if (!pk)
