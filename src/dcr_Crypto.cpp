@@ -59,7 +59,7 @@ namespace Crypto
     if (ret != 0)
     {
       debugE("Failed to seed RNG: %d (-0x%x): %s",
-                       ret, -ret, mbedtls_high_level_strerr(ret));
+             ret, -ret, mbedtls_high_level_strerr(ret));
       // Free the contexts since initialization failed
       mbedtls_ctr_drbg_free(&cryptoCtrDrbg);
       mbedtls_entropy_free(&cryptoEntropy);
@@ -117,7 +117,7 @@ namespace Crypto
     if (rc != 0)
     {
       debugE("Failed to parse RSA private key: %d (-0x%x): %s",
-                       rc, -rc, mbedtls_high_level_strerr(rc));
+             rc, -rc, mbedtls_high_level_strerr(rc));
       mbedtls_pk_free(pk); // Free the initialized context on failure
       return false;
     }
@@ -145,7 +145,7 @@ namespace Crypto
     if (rc != 0)
     {
       debugE("Failed to parse RSA public key: %d (-0x%x): %s",
-                       rc, -rc, mbedtls_high_level_strerr(rc));
+             rc, -rc, mbedtls_high_level_strerr(rc));
       mbedtls_pk_free(pk); // Free the initialized context on failure
       return false;
     }
@@ -203,7 +203,7 @@ namespace Crypto
     {
       debugE("Failed to encrypt data.");
       debugE("mbedtls_pk_encrypt returned %d (-0x%x): %s",
-                       rc, -rc, mbedtls_high_level_strerr(rc));
+             rc, -rc, mbedtls_high_level_strerr(rc));
     }
 #else
     debugW("Encryption not available in non-DEBUG builds.");
@@ -252,7 +252,7 @@ namespace Crypto
     {
       debugE("Failed to encrypt data.");
       debugE("mbedtls_pk_encrypt returned %d (-0x%x): %s",
-                       rc, -rc, mbedtls_high_level_strerr(rc));
+             rc, -rc, mbedtls_high_level_strerr(rc));
     }
   }
 
@@ -299,7 +299,7 @@ namespace Crypto
     {
       debugE("Failed to decrypt data.");
       debugE("mbedtls_pk_decrypt returned %d (-0x%x): %s",
-                       rc, -rc, mbedtls_high_level_strerr(rc));
+             rc, -rc, mbedtls_high_level_strerr(rc));
     }
 #else
     debugW("Decryption not available in non-DEBUG builds.");
@@ -484,4 +484,3 @@ namespace Crypto
     return true;
   }
 }
-
