@@ -1,6 +1,7 @@
 {
   "name": "dcr_crypto",
   "version": "1.0.0",
+  "license": "AGPL-3.0",
   "description": "ESP32 Arduino RSA crypto helpers.",
   "keywords": "esp32, arduino, crypto, rsa, mbedtls",
   "frameworks": "arduino",
